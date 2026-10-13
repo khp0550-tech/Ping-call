@@ -1,0 +1,12 @@
+{
+  "name": "PinCall - 4-Digit WebRTC Video Calling",
+  "description": "Instant peer-to-peer WebRTC video calling with secure 4-digit room PINs, screen sharing, camera/mic controls, and in-call chat.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone",
+    "display-capture"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
