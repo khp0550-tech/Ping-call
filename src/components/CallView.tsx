@@ -21,6 +21,7 @@ import {
   Sparkles,
   X,
   Volume2,
+  SwitchCamera,
 } from 'lucide-react';
 import { useWebRTC } from '../hooks/useWebRTC';
 import { VideoTile } from './VideoTile';
@@ -61,6 +62,9 @@ export const CallView: React.FC<CallViewProps> = ({
     selectedVideoInput,
     selectedAudioOutput,
     mediaError,
+    facingMode,
+    isMobile,
+    flipCamera,
     toggleAudio,
     toggleVideo,
     toggleScreenShare,
@@ -154,8 +158,18 @@ export const CallView: React.FC<CallViewProps> = ({
     setChatInput('');
   };
 
-  const copyInviteLink = () => {
+  const copyInviteLink = async () => {
     const url = `${window.location.origin}?pin=${pin}`;
+    if (navigator.share) {
+      try {
+        await navigator.share({
+          title: 'Join Video Call on PinCall',
+          text: `Join my private WebRTC call with 4-digit PIN: ${pin}`,
+          url,
+        });
+        return;
+      } catch {}
+    }
     navigator.clipboard.writeText(url);
     setCopiedLink(true);
     setTimeout(() => setCopiedLink(false), 2500);
@@ -184,7 +198,7 @@ export const CallView: React.FC<CallViewProps> = ({
   const REACTION_EMOJIS = ['❤️', '👏', '🔥', '👍', '🎉', '😂', '✋', '💡'];
 
   return (
-    <div className="relative w-screen h-screen bg-zinc-950 text-zinc-100 flex flex-col overflow-hidden select-none">
+    <div className="relative w-screen h-screen dvh-screen bg-zinc-950 text-zinc-100 flex flex-col overflow-hidden select-none">
       {/* Top Header */}
       <header className="h-16 border-b border-zinc-800/80 bg-zinc-900/60 backdrop-blur-md px-4 sm:px-6 flex items-center justify-between z-20">
         <div className="flex items-center gap-3">
@@ -290,6 +304,7 @@ export const CallView: React.FC<CallViewProps> = ({
                   isScreenSharing={isScreenSharing}
                   isActiveSpeaker={activeSpeakerId === peerId}
                   audioLevel={localAudioLevel}
+                  facingMode={facingMode}
                 />
               </div>
 
@@ -369,6 +384,7 @@ export const CallView: React.FC<CallViewProps> = ({
                   audioLevel={localAudioLevel}
                   isPinned={pinnedPeerId === peerId}
                   onPin={() => setPinnedPeerId(pinnedPeerId === peerId ? null : peerId)}
+                  facingMode={facingMode}
                 />
               </div>
 
@@ -401,7 +417,7 @@ export const CallView: React.FC<CallViewProps> = ({
 
         {/* Chat Drawer */}
         {activeDrawer === 'chat' && (
-          <aside className="w-80 sm:w-96 border-l border-zinc-800/80 bg-zinc-900/95 backdrop-blur-xl flex flex-col h-full z-30 shadow-2xl transition-all">
+          <aside className="fixed inset-x-0 bottom-0 top-16 sm:relative sm:inset-auto sm:top-0 w-full sm:w-96 border-t sm:border-t-0 sm:border-l border-zinc-800 bg-zinc-900/98 backdrop-blur-2xl flex flex-col h-auto sm:h-full z-40 shadow-2xl transition-all">
             <div className="p-4 border-b border-zinc-800 flex items-center justify-between">
               <div className="flex items-center gap-2">
                 <MessageSquare className="w-4 h-4 text-blue-400" />
@@ -495,7 +511,7 @@ export const CallView: React.FC<CallViewProps> = ({
 
         {/* Participants Drawer */}
         {activeDrawer === 'participants' && (
-          <aside className="w-80 sm:w-96 border-l border-zinc-800/80 bg-zinc-900/95 backdrop-blur-xl flex flex-col h-full z-30 shadow-2xl transition-all">
+          <aside className="fixed inset-x-0 bottom-0 top-16 sm:relative sm:inset-auto sm:top-0 w-full sm:w-96 border-t sm:border-t-0 sm:border-l border-zinc-800 bg-zinc-900/98 backdrop-blur-2xl flex flex-col h-auto sm:h-full z-40 shadow-2xl transition-all">
             <div className="p-4 border-b border-zinc-800 flex items-center justify-between">
               <div className="flex items-center gap-2">
                 <Users className="w-4 h-4 text-blue-400" />
@@ -587,12 +603,12 @@ export const CallView: React.FC<CallViewProps> = ({
       <FloatingReactions reactions={reactions} />
 
       {/* Floating Call Bottom Toolbar */}
-      <footer className="h-20 bg-zinc-950/90 border-t border-zinc-800/80 px-4 flex items-center justify-center z-20">
-        <div className="flex items-center gap-2 sm:gap-3 bg-zinc-900/90 border border-zinc-800/90 backdrop-blur-xl px-4 py-2 rounded-full shadow-2xl">
+      <footer className="h-20 bg-zinc-950/90 border-t border-zinc-800/80 px-2 sm:px-4 flex items-center justify-center z-20 pb-[env(safe-area-inset-bottom,0px)]">
+        <div className="flex items-center gap-1.5 sm:gap-3 bg-zinc-900/95 border border-zinc-800/90 backdrop-blur-xl px-2.5 sm:px-4 py-1.5 sm:py-2 rounded-full shadow-2xl max-w-full">
           {/* Audio Mute/Unmute */}
           <button
             onClick={toggleAudio}
-            className={`p-3 rounded-full transition-all duration-150 flex items-center justify-center ${
+            className={`p-2.5 sm:p-3 rounded-full transition-all duration-150 flex items-center justify-center ${
               audioEnabled
                 ? 'bg-zinc-800 text-white hover:bg-zinc-700 active:scale-95'
                 : 'bg-red-500 text-white hover:bg-red-600 shadow-md shadow-red-500/20 active:scale-95'
@@ -605,7 +621,7 @@ export const CallView: React.FC<CallViewProps> = ({
           {/* Video On/Off */}
           <button
             onClick={toggleVideo}
-            className={`p-3 rounded-full transition-all duration-150 flex items-center justify-center ${
+            className={`p-2.5 sm:p-3 rounded-full transition-all duration-150 flex items-center justify-center ${
               videoEnabled
                 ? 'bg-zinc-800 text-white hover:bg-zinc-700 active:scale-95'
                 : 'bg-red-500 text-white hover:bg-red-600 shadow-md shadow-red-500/20 active:scale-95'
@@ -615,10 +631,24 @@ export const CallView: React.FC<CallViewProps> = ({
             {videoEnabled ? <Video className="w-5 h-5" /> : <VideoOff className="w-5 h-5" />}
           </button>
 
-          {/* Screen Share */}
+          {/* Mobile Flip Camera */}
+          <button
+            onClick={flipCamera}
+            disabled={!videoEnabled}
+            className={`p-2.5 sm:p-3 rounded-full transition-all duration-150 flex items-center justify-center ${
+              videoEnabled
+                ? 'bg-zinc-800 text-white hover:bg-zinc-700 active:scale-95'
+                : 'bg-zinc-850 text-zinc-500 cursor-not-allowed'
+            }`}
+            title="Flip Camera (Front / Rear)"
+          >
+            <SwitchCamera className="w-5 h-5" />
+          </button>
+
+          {/* Screen Share (Desktop / Tablet) */}
           <button
             onClick={toggleScreenShare}
-            className={`p-3 rounded-full transition-all duration-150 flex items-center justify-center ${
+            className={`hidden sm:flex p-3 rounded-full transition-all duration-150 items-center justify-center ${
               isScreenSharing
                 ? 'bg-blue-600 text-white hover:bg-blue-700 shadow-md shadow-blue-500/20 active:scale-95'
                 : 'bg-zinc-800 text-white hover:bg-zinc-700 active:scale-95'
@@ -776,14 +806,14 @@ export const CallView: React.FC<CallViewProps> = ({
             <div className="space-y-2">
               <button
                 onClick={copyInviteLink}
-                className="w-full py-3 rounded-xl bg-blue-600 hover:bg-blue-500 text-white font-semibold text-xs flex items-center justify-center gap-2 transition shadow-md shadow-blue-600/20"
+                className="w-full py-3.5 rounded-xl bg-blue-600 hover:bg-blue-500 text-white font-semibold text-xs sm:text-sm flex items-center justify-center gap-2 transition shadow-md shadow-blue-600/20 active:scale-[0.99]"
               >
-                {copiedLink ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
-                <span>{copiedLink ? 'Invite Link Copied!' : 'Copy Full Meeting Link'}</span>
+                {copiedLink ? <Check className="w-4 h-4" /> : <Share2 className="w-4 h-4" />}
+                <span>{copiedLink ? 'Link Copied!' : 'Share Call Link'}</span>
               </button>
               <button
                 onClick={openSecondTab}
-                className="w-full py-2.5 rounded-xl bg-zinc-800 hover:bg-zinc-700 text-zinc-300 font-medium text-xs flex items-center justify-center gap-2 transition"
+                className="hidden sm:flex w-full py-2.5 rounded-xl bg-zinc-800 hover:bg-zinc-700 text-zinc-300 font-medium text-xs items-center justify-center gap-2 transition"
               >
                 <ExternalLink className="w-4 h-4 text-blue-400" />
                 <span>Open in Second Window to Test Call</span>

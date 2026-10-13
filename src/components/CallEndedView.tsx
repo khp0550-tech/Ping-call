@@ -28,7 +28,7 @@ export const CallEndedView: React.FC<CallEndedViewProps> = ({
   };
 
   return (
-    <div className="min-h-screen bg-zinc-950 text-zinc-100 flex flex-col items-center justify-center p-4">
+    <div className="min-h-screen dvh-screen bg-zinc-950 text-zinc-100 flex flex-col items-center justify-center p-4 pb-[env(safe-area-inset-bottom,0px)]">
       <div className="bg-zinc-900 border border-zinc-800 rounded-3xl p-8 max-w-md w-full text-center space-y-6 shadow-2xl backdrop-blur-xl">
         <div className="w-16 h-16 rounded-2xl bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 flex items-center justify-center mx-auto shadow-inner">
           <CheckCircle2 className="w-8 h-8" />

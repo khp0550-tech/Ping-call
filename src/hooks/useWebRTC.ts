@@ -37,6 +37,11 @@ export function useWebRTC({ pin, userName, initialAudio = true, initialVideo = t
   const [selectedVideoInput, setSelectedVideoInput] = useState<string>('');
   const [selectedAudioOutput, setSelectedAudioOutput] = useState<string>('');
   const [mediaError, setMediaError] = useState<string | null>(null);
+  const [facingMode, setFacingMode] = useState<'user' | 'environment'>('user');
+  const [isMobile] = useState(() => {
+    if (typeof window === 'undefined') return false;
+    return /iPhone|iPad|iPod|Android|webOS|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent) || window.innerWidth <= 768;
+  });
 
   // References to preserve state across callbacks
   const peerInstanceRef = useRef<Peer | null>(null);
@@ -669,6 +674,50 @@ export function useWebRTC({ pin, userName, initialAudio = true, initialVideo = t
     [initLocalStream, selectedAudioInput]
   );
 
+  // Switch between front (user) and rear (environment) camera on mobile
+  const flipCamera = useCallback(async () => {
+    const nextMode = facingMode === 'user' ? 'environment' : 'user';
+    setFacingMode(nextMode);
+
+    if (localStreamRef.current) {
+      const oldVideoTrack = localStreamRef.current.getVideoTracks()[0];
+      try {
+        const newStream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: { exact: nextMode }, width: { ideal: 1280 }, height: { ideal: 720 } },
+          audio: false,
+        }).catch(async () => {
+          // Fallback without exact constraint if device does not support exact
+          return await navigator.mediaDevices.getUserMedia({
+            video: { facingMode: nextMode },
+            audio: false,
+          });
+        });
+
+        const newVideoTrack = newStream.getVideoTracks()[0];
+        if (newVideoTrack) {
+          newVideoTrack.enabled = videoEnabledRef.current;
+          if (oldVideoTrack) {
+            localStreamRef.current.removeTrack(oldVideoTrack);
+            oldVideoTrack.stop();
+          }
+          localStreamRef.current.addTrack(newVideoTrack);
+          setLocalStream(new MediaStream(localStreamRef.current.getTracks()));
+
+          // Replace track in all active calls
+          activeCalls.current.forEach((call) => {
+            const senders = call.peerConnection?.getSenders() || [];
+            const videoSender = senders.find((s) => s.track && s.track.kind === 'video');
+            if (videoSender) {
+              videoSender.replaceTrack(newVideoTrack);
+            }
+          });
+        }
+      } catch (err) {
+        console.warn('flipCamera error:', err);
+      }
+    }
+  }, [facingMode]);
+
   return {
     peerId,
     connectionStatus,
@@ -688,6 +737,9 @@ export function useWebRTC({ pin, userName, initialAudio = true, initialVideo = t
     selectedVideoInput,
     selectedAudioOutput,
     mediaError,
+    facingMode,
+    isMobile,
+    flipCamera,
     toggleAudio,
     toggleVideo,
     toggleScreenShare,

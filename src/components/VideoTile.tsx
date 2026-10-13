@@ -14,6 +14,7 @@ interface VideoTileProps {
   audioLevel?: number;
   onPin?: () => void;
   isPinned?: boolean;
+  facingMode?: 'user' | 'environment';
 }
 
 export const VideoTile: React.FC<VideoTileProps> = ({
@@ -28,6 +29,7 @@ export const VideoTile: React.FC<VideoTileProps> = ({
   audioLevel = 0,
   onPin,
   isPinned = false,
+  facingMode = 'user',
 }) => {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -132,7 +134,7 @@ export const VideoTile: React.FC<VideoTileProps> = ({
         muted={isLocal} // Local must be muted to prevent acoustic feedback
         className={`w-full h-full ${
           isScreenSharing ? 'object-contain bg-black' : 'object-cover'
-        } ${isLocal && !isScreenSharing ? '-scale-x-100' : ''} ${
+        } ${isLocal && !isScreenSharing && facingMode !== 'environment' ? '-scale-x-100' : ''} ${
           showVideo ? 'opacity-100' : 'opacity-0 absolute'
         }`}
       />

@@ -14,6 +14,8 @@ import {
   Copy,
   Check,
   QrCode,
+  SwitchCamera,
+  Share2,
 } from 'lucide-react';
 import { AudioVisualizer } from './AudioVisualizer';
 import { createAudioLevelMeter } from '../utils/webrtc';
@@ -31,8 +33,15 @@ export const LobbyView: React.FC<LobbyViewProps> = ({ onJoin, initialPin = '' })
   const [cameraEnabled, setCameraEnabled] = useState(true);
   const [previewStream, setPreviewStream] = useState<MediaStream | null>(null);
   const [audioLevel, setAudioLevel] = useState(0);
-  const [showSettings, setShowSettings] = useState(false);
-  const [showKeypad, setShowKeypad] = useState(false);
+  const [isMobile] = useState(() => {
+    if (typeof window === 'undefined') return false;
+    return /iPhone|iPad|iPod|Android|webOS|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent) || window.innerWidth <= 768;
+  });
+  const [showKeypad, setShowKeypad] = useState(() => {
+    if (typeof window === 'undefined') return false;
+    return /iPhone|iPad|iPod|Android|webOS|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent) || window.innerWidth <= 768;
+  });
+  const [previewFacingMode, setPreviewFacingMode] = useState<'user' | 'environment'>('user');
   const [generatedPinModal, setGeneratedPinModal] = useState<string | null>(null);
   const [copiedLink, setCopiedLink] = useState(false);
   const [activeTab, setActiveTab] = useState<'join' | 'create'>('join');
@@ -40,6 +49,33 @@ export const LobbyView: React.FC<LobbyViewProps> = ({ onJoin, initialPin = '' })
   const videoPreviewRef = useRef<HTMLVideoElement | null>(null);
   const digitInputRefs = useRef<(HTMLInputElement | null)[]>([]);
   const stopAudioMeterRef = useRef<(() => void) | null>(null);
+
+  const flipPreviewCamera = async () => {
+    const next = previewFacingMode === 'user' ? 'environment' : 'user';
+    setPreviewFacingMode(next);
+    if (previewStream) {
+      const oldTrack = previewStream.getVideoTracks()[0];
+      try {
+        const newStream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: next, width: { ideal: 640 }, height: { ideal: 480 } },
+          audio: false,
+        });
+        const newTrack = newStream.getVideoTracks()[0];
+        if (newTrack) {
+          if (oldTrack) {
+            previewStream.removeTrack(oldTrack);
+            oldTrack.stop();
+          }
+          previewStream.addTrack(newTrack);
+          if (videoPreviewRef.current) {
+            videoPreviewRef.current.srcObject = previewStream;
+          }
+        }
+      } catch (err) {
+        console.warn('flipPreviewCamera failed:', err);
+      }
+    }
+  };
 
   // Initialize PIN from initialPin prop or URL query
   useEffect(() => {
@@ -187,19 +223,11 @@ export const LobbyView: React.FC<LobbyViewProps> = ({ onJoin, initialPin = '' })
     }
   };
 
-  // Instant room generation
-  const handleCreateInstantRoom = async () => {
-    try {
-      const res = await fetch('/api/room/create', { method: 'POST' });
-      const data = await res.json();
-      const newPin = data.pin || Math.floor(1000 + Math.random() * 9000).toString();
-      setGeneratedPinModal(newPin);
-      setPinDigits(newPin.split(''));
-    } catch {
-      const fallbackPin = Math.floor(1000 + Math.random() * 9000).toString();
-      setGeneratedPinModal(fallbackPin);
-      setPinDigits(fallbackPin.split(''));
-    }
+  // Instant 4-digit PIN generation (100% client-side, zero network requests, works on Vercel/Netlify/anywhere)
+  const handleCreateInstantRoom = () => {
+    const newPin = Math.floor(1000 + Math.random() * 9000).toString();
+    setGeneratedPinModal(newPin);
+    setPinDigits(newPin.split(''));
   };
 
   const currentPin = pinDigits.join('');
@@ -216,15 +244,25 @@ export const LobbyView: React.FC<LobbyViewProps> = ({ onJoin, initialPin = '' })
     onJoin(currentPin, effectiveName, micEnabled, cameraEnabled);
   };
 
-  const copyShareLink = (pin: string) => {
+  const copyShareLink = async (pin: string) => {
     const url = `${window.location.origin}?pin=${pin}`;
+    if (navigator.share) {
+      try {
+        await navigator.share({
+          title: 'PinCall - 4-Digit WebRTC Video Call',
+          text: `Join my video call with PIN: ${pin}`,
+          url,
+        });
+        return;
+      } catch {}
+    }
     navigator.clipboard.writeText(url);
     setCopiedLink(true);
     setTimeout(() => setCopiedLink(false), 2500);
   };
 
   return (
-    <div className="min-h-screen bg-zinc-950 text-zinc-100 flex flex-col justify-between selection:bg-blue-600 selection:text-white">
+    <div className="min-h-screen dvh-screen bg-zinc-950 text-zinc-100 flex flex-col justify-between selection:bg-blue-600 selection:text-white pb-[env(safe-area-inset-bottom,0px)]">
       {/* Top Navbar */}
       <header className="border-b border-zinc-800/80 bg-zinc-900/50 backdrop-blur-md px-6 py-4 flex items-center justify-between">
         <div className="flex items-center gap-3">
@@ -436,9 +474,9 @@ export const LobbyView: React.FC<LobbyViewProps> = ({ onJoin, initialPin = '' })
                   autoPlay
                   playsInline
                   muted
-                  className={`w-full h-full object-cover -scale-x-100 transition-opacity duration-200 ${
-                    cameraEnabled ? 'opacity-100' : 'opacity-0 absolute'
-                  }`}
+                  className={`w-full h-full object-cover transition-opacity duration-200 ${
+                    previewFacingMode !== 'environment' ? '-scale-x-100' : ''
+                  } ${cameraEnabled ? 'opacity-100' : 'opacity-0 absolute'}`}
                 />
 
                 {!cameraEnabled && (
@@ -451,7 +489,7 @@ export const LobbyView: React.FC<LobbyViewProps> = ({ onJoin, initialPin = '' })
                 )}
 
                 {/* Overlaid media control toggles */}
-                <div className="absolute bottom-4 left-1/2 -translate-x-1/2 flex items-center gap-3 bg-black/60 backdrop-blur-md px-4 py-2 rounded-full border border-white/10 shadow-lg">
+                <div className="absolute bottom-4 left-1/2 -translate-x-1/2 flex items-center gap-2.5 bg-black/70 backdrop-blur-md px-3.5 py-2 rounded-full border border-white/10 shadow-lg">
                   <button
                     type="button"
                     onClick={() => setMicEnabled(!micEnabled)}
@@ -476,6 +514,21 @@ export const LobbyView: React.FC<LobbyViewProps> = ({ onJoin, initialPin = '' })
                     title={cameraEnabled ? 'Turn Off Camera' : 'Turn On Camera'}
                   >
                     {cameraEnabled ? <Video className="w-4 h-4" /> : <VideoOff className="w-4 h-4" />}
+                  </button>
+
+                  {/* Mobile Camera Flip Button */}
+                  <button
+                    type="button"
+                    onClick={flipPreviewCamera}
+                    disabled={!cameraEnabled}
+                    className={`p-2.5 rounded-full transition ${
+                      cameraEnabled
+                        ? 'bg-zinc-800 text-white hover:bg-zinc-700'
+                        : 'bg-zinc-850 text-zinc-500 cursor-not-allowed'
+                    }`}
+                    title="Flip Camera (Front / Rear)"
+                  >
+                    <SwitchCamera className="w-4 h-4" />
                   </button>
                 </div>
               </div>
