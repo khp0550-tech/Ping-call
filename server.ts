@@ -154,6 +154,15 @@ app.post('/api/room/create', (_req: Request, res: Response) => {
   res.json({ pin });
 });
 
+// Legacy backward-compatibility routes
+app.get('/api/signaling/poll/:peerId', (_req: Request, res: Response) => {
+  res.json({ messages: [], events: [] });
+});
+
+app.post('/api/signaling/send', (_req: Request, res: Response) => {
+  res.json({ success: true });
+});
+
 // REST Join
 app.post('/api/room/join', (req: Request, res: Response) => {
   const { pin, peerId, userName, audioEnabled, videoEnabled } = req.body;

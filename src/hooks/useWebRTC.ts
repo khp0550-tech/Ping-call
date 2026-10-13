@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
+import { Peer, MediaConnection, DataConnection } from 'peerjs';
 import { PeerInfo, ChatMessage, ReactionItem, DeviceOption } from '../types';
 import { RTC_CONFIGURATION, createAudioLevelMeter } from '../utils/webrtc';
 
@@ -10,7 +11,7 @@ interface UseWebRTCOptions {
 }
 
 export function useWebRTC({ pin, userName, initialAudio = true, initialVideo = true }: UseWebRTCOptions) {
-  const [peerId] = useState(() => 'peer_' + Math.random().toString(36).substring(2, 9));
+  const [peerId, setPeerId] = useState<string>('');
   const [connectionStatus, setConnectionStatus] = useState<'connecting' | 'connected' | 'disconnected'>('connecting');
   const [localStream, setLocalStream] = useState<MediaStream | null>(null);
   const [screenStream, setScreenStream] = useState<MediaStream | null>(null);
@@ -37,17 +38,17 @@ export function useWebRTC({ pin, userName, initialAudio = true, initialVideo = t
   const [selectedAudioOutput, setSelectedAudioOutput] = useState<string>('');
   const [mediaError, setMediaError] = useState<string | null>(null);
 
-  // References to maintain state across callbacks without triggering effect re-runs
-  const peerConnections = useRef<Map<string, RTCPeerConnection>>(new Map());
-  const pendingCandidates = useRef<Map<string, RTCIceCandidateInit[]>>(new Map());
-  const wsRef = useRef<WebSocket | null>(null);
+  // References to preserve state across callbacks
+  const peerInstanceRef = useRef<Peer | null>(null);
+  const activeCalls = useRef<Map<string, MediaConnection>>(new Map());
+  const activeDataConns = useRef<Map<string, DataConnection>>(new Map());
   const localStreamRef = useRef<MediaStream | null>(null);
   const screenStreamRef = useRef<MediaStream | null>(null);
-  const pollTimerRef = useRef<number | null>(null);
   const stopAudioMeterRef = useRef<(() => void) | null>(null);
+  const mySlotRef = useRef<number>(1);
   const audioEnabledRef = useRef(audioEnabled);
   const videoEnabledRef = useRef(videoEnabled);
-  const isJoinedRef = useRef(false);
+  const userNameRef = useRef(userName);
 
   useEffect(() => {
     audioEnabledRef.current = audioEnabled;
@@ -56,6 +57,10 @@ export function useWebRTC({ pin, userName, initialAudio = true, initialVideo = t
   useEffect(() => {
     videoEnabledRef.current = videoEnabled;
   }, [videoEnabled]);
+
+  useEffect(() => {
+    userNameRef.current = userName;
+  }, [userName]);
 
   useEffect(() => {
     localStreamRef.current = localStream;
@@ -99,40 +104,20 @@ export function useWebRTC({ pin, userName, initialAudio = true, initialVideo = t
     }
   }, [selectedAudioInput, selectedVideoInput, selectedAudioOutput]);
 
-  // Send signaling message via WebSocket if open, with HTTP POST fallback
-  const sendSignal = useCallback(
-    async (to: string, data: any) => {
-      let sentViaWS = false;
-      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+  // Broadcast data payload to all connected peers
+  const broadcastData = useCallback((payload: any) => {
+    activeDataConns.current.forEach((conn) => {
+      if (conn.open) {
         try {
-          wsRef.current.send(
-            JSON.stringify({
-              type: 'signal',
-              to,
-              data,
-            })
-          );
-          sentViaWS = true;
-        } catch {}
-      }
-
-      // Always also send via HTTP if WS is not confirmed open or as companion
-      if (!sentViaWS) {
-        try {
-          await fetch('/api/room/signal', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ pin, from: peerId, to, data }),
-          });
+          conn.send(payload);
         } catch (e) {
-          console.warn('HTTP signal error:', e);
+          console.warn('Data send error:', e);
         }
       }
-    },
-    [pin, peerId]
-  );
+    });
+  }, []);
 
-  // Initialize or reconfigure local stream
+  // Initialize Local Media Stream
   const initLocalStream = useCallback(
     async (audioDevId?: string, videoDevId?: string) => {
       try {
@@ -156,12 +141,12 @@ export function useWebRTC({ pin, userName, initialAudio = true, initialVideo = t
         try {
           stream = await navigator.mediaDevices.getUserMedia(constraints);
         } catch (err) {
-          console.warn('Full audio/video getUserMedia failed, attempting audio-only:', err);
+          console.warn('Audio+Video getUserMedia failed, trying audio-only:', err);
           try {
             stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
           } catch {
             stream = new MediaStream();
-            setMediaError('Camera & microphone permissions unavailable. You are connected in audio/video view-only mode.');
+            setMediaError('Camera & microphone permissions unavailable. You are in view/listen mode.');
           }
         }
 
@@ -175,24 +160,22 @@ export function useWebRTC({ pin, userName, initialAudio = true, initialVideo = t
         setLocalStream(stream);
         localStreamRef.current = stream;
 
-        // Start volume visualizer
+        // Monitor volume for visualizer
         stopAudioMeterRef.current = createAudioLevelMeter(stream, (level) => {
           setLocalAudioLevel(level);
           if (level > 25 && audioEnabledRef.current) {
-            setActiveSpeakerId(peerId);
+            setActiveSpeakerId(peerId || 'self');
           }
         });
 
-        // If peer connections exist, replace or add tracks
+        // Replace track in existing calls if any
         const currentStream = screenStreamRef.current || stream;
-        peerConnections.current.forEach((pc) => {
+        activeCalls.current.forEach((call) => {
+          const senders = call.peerConnection?.getSenders() || [];
           currentStream.getTracks().forEach((track) => {
-            const senders = pc.getSenders();
             const sender = senders.find((s) => s.track && s.track.kind === track.kind);
             if (sender) {
               sender.replaceTrack(track);
-            } else {
-              pc.addTrack(track, currentStream);
             }
           });
         });
@@ -200,7 +183,7 @@ export function useWebRTC({ pin, userName, initialAudio = true, initialVideo = t
         await updateDeviceList();
         return stream;
       } catch (err: any) {
-        console.error('initLocalStream fatal error:', err);
+        console.error('initLocalStream error:', err);
         setMediaError('Could not access microphone or camera.');
         const emptyStream = new MediaStream();
         setLocalStream(emptyStream);
@@ -211,171 +194,22 @@ export function useWebRTC({ pin, userName, initialAudio = true, initialVideo = t
     [peerId, updateDeviceList]
   );
 
-  // Helper to create or get RTCPeerConnection
-  const getOrCreatePeerConnection = useCallback(
-    (remotePeerId: string): RTCPeerConnection => {
-      let pc = peerConnections.current.get(remotePeerId);
-      if (pc && pc.connectionState !== 'closed') {
-        return pc;
-      }
+  // Handle incoming data channel messages
+  const handleDataMessage = useCallback(
+    (senderPeerId: string, data: any) => {
+      if (!data || typeof data !== 'object') return;
 
-      pc = new RTCPeerConnection(RTC_CONFIGURATION);
-      peerConnections.current.set(remotePeerId, pc);
-
-      // Add local media tracks
-      const currentStream = screenStreamRef.current || localStreamRef.current;
-      if (currentStream) {
-        currentStream.getTracks().forEach((track) => {
-          try {
-            pc!.addTrack(track, currentStream);
-          } catch (e) {
-            console.warn('addTrack error:', e);
-          }
-        });
-      }
-
-      // ICE Candidates generated locally
-      pc.onicecandidate = (event) => {
-        if (event.candidate) {
-          sendSignal(remotePeerId, { candidate: event.candidate });
-        }
-      };
-
-      // Remote track received
-      pc.ontrack = (event) => {
-        const stream = event.streams[0] || new MediaStream([event.track]);
-        setRemoteStreams((prev) => {
-          const next = new Map(prev);
-          next.set(remotePeerId, stream);
-          return next;
-        });
-
-        // Listen for volume for active speaker detection
-        createAudioLevelMeter(stream, (volume) => {
-          if (volume > 25) {
-            setActiveSpeakerId(remotePeerId);
-          }
-        });
-      };
-
-      pc.oniceconnectionstatechange = () => {
-        console.log(`[PinCall] ICE with ${remotePeerId}:`, pc!.iceConnectionState);
-      };
-
-      return pc;
-    },
-    [sendSignal]
-  );
-
-  // Initiate WebRTC offer to another peer
-  const initiateOffer = useCallback(
-    async (targetPeerId: string) => {
-      try {
-        const pc = getOrCreatePeerConnection(targetPeerId);
-        const offer = await pc.createOffer({
-          offerToReceiveAudio: true,
-          offerToReceiveVideo: true,
-        });
-        await pc.setLocalDescription(offer);
-        console.log(`[PinCall] Sent offer to ${targetPeerId}`);
-        await sendSignal(targetPeerId, offer);
-      } catch (err) {
-        console.error(`Failed to initiate offer to ${targetPeerId}:`, err);
-      }
-    },
-    [getOrCreatePeerConnection, sendSignal]
-  );
-
-  // Handle incoming signaling messages (offer, answer, candidate)
-  const processSignalingData = useCallback(
-    async (fromPeerId: string, data: any) => {
-      try {
-        const pc = getOrCreatePeerConnection(fromPeerId);
-
-        if (data.type === 'offer') {
-          console.log(`[PinCall] Received offer from ${fromPeerId}`);
-          await pc.setRemoteDescription(new RTCSessionDescription(data));
-
-          // Flush queued candidates
-          const queued = pendingCandidates.current.get(fromPeerId) || [];
-          for (const cand of queued) {
-            try {
-              await pc.addIceCandidate(new RTCIceCandidate(cand));
-            } catch (e) {
-              console.warn('ICE add error:', e);
-            }
-          }
-          pendingCandidates.current.delete(fromPeerId);
-
-          const answer = await pc.createAnswer();
-          await pc.setLocalDescription(answer);
-          console.log(`[PinCall] Sent answer to ${fromPeerId}`);
-          await sendSignal(fromPeerId, answer);
-        } else if (data.type === 'answer') {
-          console.log(`[PinCall] Received answer from ${fromPeerId}`);
-          await pc.setRemoteDescription(new RTCSessionDescription(data));
-
-          // Flush queued candidates
-          const queued = pendingCandidates.current.get(fromPeerId) || [];
-          for (const cand of queued) {
-            try {
-              await pc.addIceCandidate(new RTCIceCandidate(cand));
-            } catch (e) {
-              console.warn('ICE add error:', e);
-            }
-          }
-          pendingCandidates.current.delete(fromPeerId);
-        } else if (data.candidate) {
-          if (pc.remoteDescription && pc.remoteDescription.type) {
-            try {
-              await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
-            } catch (e) {
-              console.warn('Add ice candidate error:', e);
-            }
-          } else {
-            let list = pendingCandidates.current.get(fromPeerId);
-            if (!list) {
-              list = [];
-              pendingCandidates.current.set(fromPeerId, list);
-            }
-            list.push(data.candidate);
-          }
-        }
-      } catch (err) {
-        console.error(`Error processing signaling data from ${fromPeerId}:`, err);
-      }
-    },
-    [getOrCreatePeerConnection, sendSignal]
-  );
-
-  // Incoming event router (handles both WS and HTTP events)
-  const handleEvent = useCallback(
-    async (msg: any) => {
-      switch (msg.type) {
-        case 'joined': {
-          const existingPeers: PeerInfo[] = msg.peers || [];
-          console.log(`[PinCall] Joined room #${pin}. Existing peers:`, existingPeers.length);
+      switch (data.type) {
+        case 'hello': {
           setPeers((prev) => {
             const next = new Map(prev);
-            for (const p of existingPeers) {
-              next.set(p.id, p);
-            }
-            return next;
-          });
-
-          // Send offers to all existing peers
-          for (const p of existingPeers) {
-            await initiateOffer(p.id);
-          }
-          break;
-        }
-
-        case 'peer-joined': {
-          const newPeer: PeerInfo = msg.peer;
-          console.log(`[PinCall] New peer joined room #${pin}:`, newPeer.name, newPeer.id);
-          setPeers((prev) => {
-            const next = new Map(prev);
-            next.set(newPeer.id, newPeer);
+            next.set(senderPeerId, {
+              id: senderPeerId,
+              name: data.userName || `User-${senderPeerId.slice(-4)}`,
+              audioEnabled: data.audioEnabled !== false,
+              videoEnabled: data.videoEnabled !== false,
+              isScreenSharing: !!data.isScreenSharing,
+            });
             return next;
           });
 
@@ -385,7 +219,7 @@ export function useWebRTC({ pin, userName, initialAudio = true, initialVideo = t
               id: 'join_' + Date.now(),
               peerId: 'system',
               userName: 'System',
-              text: `${newPeer.name} joined the call`,
+              text: `${data.userName || 'A participant'} joined the call`,
               timestamp: Date.now(),
               isSystem: true,
             },
@@ -393,21 +227,16 @@ export function useWebRTC({ pin, userName, initialAudio = true, initialVideo = t
           break;
         }
 
-        case 'signal': {
-          await processSignalingData(msg.from, msg.data);
-          break;
-        }
-
-        case 'peer-media-state': {
+        case 'media-state': {
           setPeers((prev) => {
             const next = new Map(prev);
-            const peer = next.get(msg.peerId);
+            const peer = next.get(senderPeerId);
             if (peer) {
-              next.set(msg.peerId, {
+              next.set(senderPeerId, {
                 ...peer,
-                audioEnabled: msg.audioEnabled ?? peer.audioEnabled,
-                videoEnabled: msg.videoEnabled ?? peer.videoEnabled,
-                isScreenSharing: msg.isScreenSharing ?? peer.isScreenSharing,
+                audioEnabled: data.audioEnabled ?? peer.audioEnabled,
+                videoEnabled: data.videoEnabled ?? peer.videoEnabled,
+                isScreenSharing: data.isScreenSharing ?? peer.isScreenSharing,
               });
             }
             return next;
@@ -417,190 +246,259 @@ export function useWebRTC({ pin, userName, initialAudio = true, initialVideo = t
 
         case 'chat': {
           setChatMessages((prev) => {
-            if (prev.some((c) => c.id === msg.id)) return prev;
-            return [...prev, msg];
+            if (prev.some((c) => c.id === data.id)) return prev;
+            return [...prev, data];
           });
           break;
         }
 
         case 'reaction': {
           setReactions((prev) => {
-            if (prev.some((r) => r.id === msg.id)) return prev;
-            return [...prev, msg];
+            if (prev.some((r) => r.id === data.id)) return prev;
+            return [...prev, data];
           });
           setTimeout(() => {
-            setReactions((prev) => prev.filter((r) => r.id !== msg.id));
+            setReactions((prev) => prev.filter((r) => r.id !== data.id));
           }, 3500);
-          break;
-        }
-
-        case 'peer-left': {
-          const leavingId = msg.peerId;
-          const pc = peerConnections.current.get(leavingId);
-          if (pc) {
-            pc.close();
-            peerConnections.current.delete(leavingId);
-          }
-          let leavingName = 'Participant';
-          setPeers((prev) => {
-            const next = new Map(prev);
-            const p = next.get(leavingId);
-            if (p) leavingName = p.name;
-            next.delete(leavingId);
-            return next;
-          });
-          setRemoteStreams((prev) => {
-            const next = new Map(prev);
-            next.delete(leavingId);
-            return next;
-          });
-
-          setChatMessages((prev) => [
-            ...prev,
-            {
-              id: 'left_' + Date.now(),
-              peerId: 'system',
-              userName: 'System',
-              text: `${leavingName} left the call`,
-              timestamp: Date.now(),
-              isSystem: true,
-            },
-          ]);
           break;
         }
       }
     },
-    [pin, initiateOffer, processSignalingData]
+    []
   );
 
-  // Master Connection Effect: joins room and starts signaling
-  useEffect(() => {
-    let isDisposed = false;
+  // Setup data connection handlers
+  const setupDataConnection = useCallback(
+    (conn: DataConnection, targetPeerId: string) => {
+      activeDataConns.current.set(targetPeerId, conn);
 
-    const connect = async () => {
-      // 1. Acquire local camera/mic stream
-      await initLocalStream();
-      if (isDisposed) return;
+      conn.on('open', () => {
+        console.log(`[PinCall] Data connection open with ${targetPeerId}`);
+        // Send hello with our info
+        conn.send({
+          type: 'hello',
+          userName: userNameRef.current,
+          audioEnabled: audioEnabledRef.current,
+          videoEnabled: videoEnabledRef.current,
+          isScreenSharing: !!screenStreamRef.current,
+        });
+      });
 
-      setConnectionStatus('connecting');
+      conn.on('data', (data) => {
+        handleDataMessage(targetPeerId, data);
+      });
 
-      // 2. HTTP Join (Guarantees registration regardless of WS proxies)
-      try {
-        const joinRes = await fetch('/api/room/join', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            pin,
-            peerId,
-            userName,
-            audioEnabled: audioEnabledRef.current,
-            videoEnabled: videoEnabledRef.current,
-          }),
+      conn.on('close', () => {
+        console.log(`[PinCall] Data connection closed with ${targetPeerId}`);
+        activeDataConns.current.delete(targetPeerId);
+      });
+
+      conn.on('error', (err) => {
+        console.warn(`[PinCall] Data conn error with ${targetPeerId}:`, err);
+      });
+    },
+    [handleDataMessage]
+  );
+
+  // Setup media call handlers
+  const setupMediaCall = useCallback(
+    (call: MediaConnection, remoteId: string) => {
+      activeCalls.current.set(remoteId, call);
+
+      call.on('stream', (remoteStream) => {
+        console.log(`[PinCall] Received remote stream from ${remoteId}`);
+        setRemoteStreams((prev) => {
+          const next = new Map(prev);
+          next.set(remoteId, remoteStream);
+          return next;
         });
 
-        if (joinRes.ok) {
-          const joinData = await joinRes.json();
-          if (!isDisposed) {
-            isJoinedRef.current = true;
-            setConnectionStatus('connected');
-            await handleEvent(joinData);
+        // Monitor remote volume for active speaker detection
+        createAudioLevelMeter(remoteStream, (volume) => {
+          if (volume > 25) {
+            setActiveSpeakerId(remoteId);
           }
-        }
-      } catch (err) {
-        console.warn('HTTP join error:', err);
-      }
+        });
+      });
 
-      // 3. Connect WebSocket for sub-second signaling
-      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const wsUrl = `${protocol}//${window.location.host}/ws`;
-
-      try {
-        const ws = new WebSocket(wsUrl);
-        wsRef.current = ws;
-
-        ws.onopen = () => {
-          if (isDisposed) return;
-          console.log('[PinCall] WebSocket connected to server');
-          setConnectionStatus('connected');
-          ws.send(
-            JSON.stringify({
-              type: 'join',
-              pin,
-              peerId,
-              userName,
-              audioEnabled: audioEnabledRef.current,
-              videoEnabled: videoEnabledRef.current,
-            })
-          );
-        };
-
-        ws.onmessage = async (event) => {
-          if (isDisposed) return;
-          try {
-            const msg = JSON.parse(event.data);
-            await handleEvent(msg);
-          } catch (e) {
-            console.error('WS message error:', e);
+      call.on('close', () => {
+        console.log(`[PinCall] Call closed with ${remoteId}`);
+        activeCalls.current.delete(remoteId);
+        setRemoteStreams((prev) => {
+          const next = new Map(prev);
+          next.delete(remoteId);
+          return next;
+        });
+        setPeers((prev) => {
+          const next = new Map(prev);
+          const leaving = next.get(remoteId);
+          if (leaving) {
+            setChatMessages((p) => [
+              ...p,
+              {
+                id: 'left_' + Date.now(),
+                peerId: 'system',
+                userName: 'System',
+                text: `${leaving.name} left the call`,
+                timestamp: Date.now(),
+                isSystem: true,
+              },
+            ]);
           }
-        };
+          next.delete(remoteId);
+          return next;
+        });
+      });
 
-        ws.onclose = () => {
-          if (isDisposed) return;
-          console.log('[PinCall] WebSocket closed; relying on polling fallback');
-        };
+      call.on('error', (err) => {
+        console.warn(`[PinCall] Call error with ${remoteId}:`, err);
+      });
+    },
+    []
+  );
 
-        ws.onerror = (e) => {
-          console.warn('[PinCall] WebSocket error:', e);
-        };
-      } catch (err) {
-        console.warn('Failed to create WebSocket:', err);
-      }
+  // Master Connection Effect: 4-digit PIN slot-based WebRTC mesh
+  useEffect(() => {
+    let isDisposed = false;
+    let peerInstance: Peer | null = null;
 
-      // 4. Background Polling Loop (Active fallback that guarantees message delivery)
-      pollTimerRef.current = window.setInterval(async () => {
+    const startRoomConnection = async () => {
+      const stream = await initLocalStream();
+      if (isDisposed) return;
+
+      // Slot claim algorithm:
+      // Room PIN 4829 -> IDs: pincall_4829_1, pincall_4829_2, ... up to 8
+      let currentSlot = 1;
+
+      const tryClaimSlot = (slot: number) => {
         if (isDisposed) return;
-        try {
-          const res = await fetch(`/api/room/poll/${pin}/${peerId}`);
-          if (res.ok) {
-            const data = await res.json();
-            if (data.events && Array.isArray(data.events)) {
-              for (const ev of data.events) {
-                await handleEvent(ev);
+        mySlotRef.current = slot;
+        const targetId = `pincall_${pin}_${slot}`;
+
+        console.log(`[PinCall] Attempting to claim room slot: ${targetId}`);
+
+        const p = new Peer(targetId, {
+          config: RTC_CONFIGURATION,
+          debug: 1,
+        });
+
+        p.on('open', (claimedId) => {
+          if (isDisposed) {
+            p.destroy();
+            return;
+          }
+          console.log(`[PinCall] Successfully joined Room #${pin} as Slot ${slot} (${claimedId})`);
+          peerInstance = p;
+          peerInstanceRef.current = p;
+          setPeerId(claimedId);
+          setConnectionStatus('connected');
+
+          setChatMessages((prev) => [
+            ...prev,
+            {
+              id: 'welcome_' + Date.now(),
+              peerId: 'system',
+              userName: 'PinCall',
+              text: `Connected to Room #${pin}. Share this 4-digit PIN to invite others!`,
+              timestamp: Date.now(),
+              isSystem: true,
+            },
+          ]);
+
+          // Handle incoming calls (from higher slots)
+          p.on('call', (incomingCall) => {
+            console.log(`[PinCall] Answering incoming call from ${incomingCall.peer}`);
+            const outgoingStream = screenStreamRef.current || localStreamRef.current || new MediaStream();
+            incomingCall.answer(outgoingStream);
+            setupMediaCall(incomingCall, incomingCall.peer);
+          });
+
+          // Handle incoming data connections (from higher slots)
+          p.on('connection', (incomingConn) => {
+            console.log(`[PinCall] Accepted data connection from ${incomingConn.peer}`);
+            setupDataConnection(incomingConn, incomingConn.peer);
+          });
+
+          // Now connect to all existing peers in lower slots (1 .. slot - 1)
+          const mediaStream = screenStreamRef.current || localStreamRef.current || stream;
+          for (let lowerSlot = 1; lowerSlot < slot; lowerSlot++) {
+            const lowerPeerId = `pincall_${pin}_${lowerSlot}`;
+            console.log(`[PinCall] Calling lower slot peer: ${lowerPeerId}`);
+
+            // 1. Data Connection
+            const dataConn = p.connect(lowerPeerId, { reliable: true });
+            setupDataConnection(dataConn, lowerPeerId);
+
+            // 2. Media Call
+            const call = p.call(lowerPeerId, mediaStream);
+            setupMediaCall(call, lowerPeerId);
+          }
+
+          // Periodic check to discover any newly available lower peers or keep connections alive
+          const pollTimer = setInterval(() => {
+            if (isDisposed || p.destroyed) {
+              clearInterval(pollTimer);
+              return;
+            }
+            for (let lower = 1; lower < slot; lower++) {
+              const target = `pincall_${pin}_${lower}`;
+              if (!activeCalls.current.has(target)) {
+                const s = screenStreamRef.current || localStreamRef.current || new MediaStream();
+                const call = p.call(target, s);
+                setupMediaCall(call, target);
+                const d = p.connect(target, { reliable: true });
+                setupDataConnection(d, target);
               }
             }
+          }, 4000);
+        });
+
+        p.on('error', (err: any) => {
+          if (err.type === 'unavailable-id') {
+            console.log(`[PinCall] Slot ${slot} is occupied. Trying next slot...`);
+            p.destroy();
+            if (slot < 8) {
+              tryClaimSlot(slot + 1);
+            } else {
+              // If all 8 standard slots are full, join as guest extension
+              const randomGuestSlot = `pincall_${pin}_guest_${Math.floor(100 + Math.random() * 900)}`;
+              const guestPeer = new Peer(randomGuestSlot, { config: RTC_CONFIGURATION });
+              guestPeer.on('open', (gId) => {
+                peerInstance = guestPeer;
+                peerInstanceRef.current = guestPeer;
+                setPeerId(gId);
+                setConnectionStatus('connected');
+                // Call slots 1..8
+                const s = screenStreamRef.current || localStreamRef.current || stream;
+                for (let i = 1; i <= 8; i++) {
+                  const target = `pincall_${pin}_${i}`;
+                  guestPeer.call(target, s);
+                  guestPeer.connect(target, { reliable: true });
+                }
+              });
+            }
+          } else {
+            console.warn('[PinCall] PeerJS error:', err.type, err.message);
           }
-        } catch {}
-      }, 1200);
+        });
+      };
+
+      tryClaimSlot(1);
     };
 
-    connect();
+    startRoomConnection();
 
     return () => {
       isDisposed = true;
-      if (pollTimerRef.current) {
-        clearInterval(pollTimerRef.current);
-      }
-
-      // Send leave via WS and HTTP
-      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      if (peerInstanceRef.current) {
         try {
-          wsRef.current.send(JSON.stringify({ type: 'leave' }));
-          wsRef.current.close();
+          peerInstanceRef.current.destroy();
         } catch {}
+        peerInstanceRef.current = null;
       }
+      activeCalls.current.clear();
+      activeDataConns.current.clear();
 
-      fetch('/api/room/leave', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ pin, peerId }),
-        keepalive: true,
-      }).catch(() => {});
-
-      // Close all peer connections
-      peerConnections.current.forEach((pc) => pc.close());
-      peerConnections.current.clear();
-
-      // Stop media tracks
       if (localStreamRef.current) {
         localStreamRef.current.getTracks().forEach((t) => t.stop());
       }
@@ -611,57 +509,43 @@ export function useWebRTC({ pin, userName, initialAudio = true, initialVideo = t
         stopAudioMeterRef.current();
       }
     };
-  }, [pin, peerId, userName, initLocalStream, handleEvent]);
+  }, [pin, initLocalStream, setupMediaCall, setupDataConnection]);
 
-  // Audio Toggle
+  // Toggle Audio
   const toggleAudio = useCallback(() => {
     setAudioEnabled((prev) => {
       const next = !prev;
       if (localStreamRef.current) {
-        localStreamRef.current.getAudioTracks().forEach((track) => {
-          track.enabled = next;
+        localStreamRef.current.getAudioTracks().forEach((t) => {
+          t.enabled = next;
         });
       }
-
-      const payload = { type: 'media-state', pin, peerId, audioEnabled: next };
-      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-        wsRef.current.send(JSON.stringify(payload));
-      }
-      fetch('/api/room/media-state', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      }).catch(() => {});
-
+      broadcastData({
+        type: 'media-state',
+        audioEnabled: next,
+      });
       return next;
     });
-  }, [pin, peerId]);
+  }, [broadcastData]);
 
-  // Video Toggle
+  // Toggle Video
   const toggleVideo = useCallback(() => {
     setVideoEnabled((prev) => {
       const next = !prev;
       if (localStreamRef.current) {
-        localStreamRef.current.getVideoTracks().forEach((track) => {
-          track.enabled = next;
+        localStreamRef.current.getVideoTracks().forEach((t) => {
+          t.enabled = next;
         });
       }
-
-      const payload = { type: 'media-state', pin, peerId, videoEnabled: next };
-      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-        wsRef.current.send(JSON.stringify(payload));
-      }
-      fetch('/api/room/media-state', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      }).catch(() => {});
-
+      broadcastData({
+        type: 'media-state',
+        videoEnabled: next,
+      });
       return next;
     });
-  }, [pin, peerId]);
+  }, [broadcastData]);
 
-  // Screen Share Toggle
+  // Toggle Screen Sharing
   const toggleScreenShare = useCallback(async () => {
     if (isScreenSharing) {
       if (screenStreamRef.current) {
@@ -671,24 +555,21 @@ export function useWebRTC({ pin, userName, initialAudio = true, initialVideo = t
       }
       setIsScreenSharing(false);
 
-      const videoTrack = localStreamRef.current?.getVideoTracks()[0];
-      if (videoTrack) {
-        peerConnections.current.forEach((pc) => {
-          const senders = pc.getSenders();
+      const camVideoTrack = localStreamRef.current?.getVideoTracks()[0];
+      if (camVideoTrack) {
+        activeCalls.current.forEach((call) => {
+          const senders = call.peerConnection?.getSenders() || [];
           const videoSender = senders.find((s) => s.track && s.track.kind === 'video');
-          if (videoSender) videoSender.replaceTrack(videoTrack);
+          if (videoSender) {
+            videoSender.replaceTrack(camVideoTrack);
+          }
         });
       }
 
-      const payload = { type: 'media-state', pin, peerId, isScreenSharing: false };
-      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-        wsRef.current.send(JSON.stringify(payload));
-      }
-      fetch('/api/room/media-state', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      }).catch(() => {});
+      broadcastData({
+        type: 'media-state',
+        isScreenSharing: false,
+      });
     } else {
       try {
         const stream = await navigator.mediaDevices.getDisplayMedia({
@@ -700,101 +581,76 @@ export function useWebRTC({ pin, userName, initialAudio = true, initialVideo = t
         screenStreamRef.current = stream;
         setIsScreenSharing(true);
 
-        const screenVideoTrack = stream.getVideoTracks()[0];
-        peerConnections.current.forEach((pc) => {
-          const senders = pc.getSenders();
+        const screenTrack = stream.getVideoTracks()[0];
+        activeCalls.current.forEach((call) => {
+          const senders = call.peerConnection?.getSenders() || [];
           const videoSender = senders.find((s) => s.track && s.track.kind === 'video');
-          if (videoSender && screenVideoTrack) {
-            videoSender.replaceTrack(screenVideoTrack);
+          if (videoSender && screenTrack) {
+            videoSender.replaceTrack(screenTrack);
           }
         });
 
-        screenVideoTrack.onended = () => {
+        screenTrack.onended = () => {
           setIsScreenSharing(false);
           setScreenStream(null);
           screenStreamRef.current = null;
-          const camTrack = localStreamRef.current?.getVideoTracks()[0];
-          if (camTrack) {
-            peerConnections.current.forEach((pc) => {
-              const senders = pc.getSenders();
+          const cam = localStreamRef.current?.getVideoTracks()[0];
+          if (cam) {
+            activeCalls.current.forEach((call) => {
+              const senders = call.peerConnection?.getSenders() || [];
               const videoSender = senders.find((s) => s.track && s.track.kind === 'video');
-              if (videoSender) videoSender.replaceTrack(camTrack);
+              if (videoSender) videoSender.replaceTrack(cam);
             });
           }
-          const payload = { type: 'media-state', pin, peerId, isScreenSharing: false };
-          if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-            wsRef.current.send(JSON.stringify(payload));
-          }
-          fetch('/api/room/media-state', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload),
-          }).catch(() => {});
+          broadcastData({
+            type: 'media-state',
+            isScreenSharing: false,
+          });
         };
 
-        const payload = { type: 'media-state', pin, peerId, isScreenSharing: true };
-        if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-          wsRef.current.send(JSON.stringify(payload));
-        }
-        fetch('/api/room/media-state', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload),
-        }).catch(() => {});
+        broadcastData({
+          type: 'media-state',
+          isScreenSharing: true,
+        });
       } catch (err) {
-        console.warn('Screen share failed or cancelled:', err);
+        console.warn('Screen share cancelled or failed:', err);
       }
     }
-  }, [isScreenSharing, pin, peerId]);
+  }, [isScreenSharing, broadcastData]);
 
-  // Send Chat Message
+  // Send In-call Chat Message
   const sendChatMessage = useCallback(
     (text: string) => {
       if (!text.trim()) return;
-      const payload = {
-        type: 'chat',
-        pin,
-        peerId,
-        userName,
+      const msg: ChatMessage = {
+        id: 'chat_' + Math.random().toString(36).substring(2, 9),
+        peerId: peerId || 'self',
+        userName: userNameRef.current,
         text: text.trim(),
+        timestamp: Date.now(),
       };
-      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-        wsRef.current.send(JSON.stringify(payload));
-      }
-      fetch('/api/room/chat', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      }).catch(() => {});
+      setChatMessages((prev) => [...prev, msg]);
+      broadcastData(msg);
     },
-    [pin, peerId, userName]
+    [peerId, broadcastData]
   );
 
-  // Send Reaction
+  // Send Floating Emoji Reaction
   const sendReaction = useCallback(
     (emoji: string) => {
-      const payload = { type: 'reaction', pin, peerId, emoji };
-      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-        wsRef.current.send(JSON.stringify(payload));
-      }
-      fetch('/api/room/reaction', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      }).catch(() => {});
-
-      const localItem: ReactionItem = {
-        id: 'react_local_' + Math.random().toString(36).substring(2, 9),
-        peerId,
+      const item: ReactionItem = {
+        id: 'react_' + Math.random().toString(36).substring(2, 9),
+        peerId: peerId || 'self',
         emoji,
         timestamp: Date.now(),
       };
-      setReactions((prev) => [...prev, localItem]);
+      setReactions((prev) => [...prev, item]);
+      broadcastData(item);
       setTimeout(() => {
-        setReactions((prev) => prev.filter((r) => r.id !== localItem.id));
+        setReactions((prev) => prev.filter((r) => r.id !== item.id));
       }, 3500);
     },
-    [pin, peerId]
+    [peerId, broadcastData]
   );
 
   const switchAudioDevice = useCallback(
