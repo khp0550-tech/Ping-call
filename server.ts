@@ -17,11 +17,13 @@ interface Peer {
   id: string;
   name: string;
   pin: string;
-  ws?: WebSocket;
+  ws?: WebSocket | null;
   audioEnabled: boolean;
   videoEnabled: boolean;
   isScreenSharing: boolean;
   joinedAt: number;
+  lastSeenAt: number;
+  eventsQueue: any[];
 }
 
 interface Room {
@@ -30,13 +32,8 @@ interface Room {
   peers: Map<string, Peer>;
 }
 
-// In-memory rooms repository
 const rooms = new Map<string, Room>();
 
-// Polling fallback message queue for non-WS or fallback scenarios
-const fallbackMessageQueues = new Map<string, any[]>();
-
-// Helper to get or create room
 function getOrCreateRoom(pin: string): Room {
   let room = rooms.get(pin);
   if (!room) {
@@ -50,7 +47,6 @@ function getOrCreateRoom(pin: string): Room {
   return room;
 }
 
-// Helper to generate a random 4-digit pin that is preferably empty
 function generateUniquePin(): string {
   for (let i = 0; i < 50; i++) {
     const candidate = Math.floor(1000 + Math.random() * 9000).toString();
@@ -62,7 +58,68 @@ function generateUniquePin(): string {
   return Math.floor(1000 + Math.random() * 9000).toString();
 }
 
-// REST endpoints
+// Dispatch event to a specific peer (via WS if open, and append to eventsQueue)
+function dispatchToPeer(peer: Peer, event: any) {
+  // 1. Try WebSocket
+  if (peer.ws && peer.ws.readyState === WebSocket.OPEN) {
+    try {
+      peer.ws.send(JSON.stringify(event));
+    } catch (e) {
+      console.warn(`Failed to send WS to ${peer.id}:`, e);
+    }
+  }
+  // 2. Also keep in queue for polling clients
+  peer.eventsQueue.push(event);
+  if (peer.eventsQueue.length > 100) {
+    peer.eventsQueue.shift();
+  }
+}
+
+// Broadcast event to all peers in a room (optionally exclude one peer)
+function broadcastToRoom(pin: string, event: any, excludePeerId?: string) {
+  const room = rooms.get(pin);
+  if (!room) return;
+  for (const [id, peer] of room.peers.entries()) {
+    if (id !== excludePeerId) {
+      dispatchToPeer(peer, event);
+    }
+  }
+}
+
+// Remove a peer from a room
+function removePeerFromRoom(pin: string, peerId: string) {
+  const room = rooms.get(pin);
+  if (!room) return;
+  const peer = room.peers.get(peerId);
+  if (peer) {
+    room.peers.delete(peerId);
+    console.log(`[PinCall] Peer ${peer.name} (${peerId}) left Room #${pin}. Remaining: ${room.peers.size}`);
+    broadcastToRoom(pin, {
+      type: 'peer-left',
+      peerId,
+    });
+    if (room.peers.size === 0) {
+      rooms.delete(pin);
+    }
+  }
+}
+
+// Cleanup inactive peers every 15s
+setInterval(() => {
+  const now = Date.now();
+  for (const [pin, room] of rooms.entries()) {
+    for (const [peerId, peer] of room.peers.entries()) {
+      // Inactive if WS is not open AND hasn't polled in 35 seconds
+      const isWsDead = !peer.ws || peer.ws.readyState !== WebSocket.OPEN;
+      if (isWsDead && now - peer.lastSeenAt > 35000) {
+        removePeerFromRoom(pin, peerId);
+      }
+    }
+  }
+}, 15000);
+
+// --- REST API Endpoints ---
+
 app.get('/api/health', (_req: Request, res: Response) => {
   let totalPeers = 0;
   for (const r of rooms.values()) {
@@ -97,36 +154,189 @@ app.post('/api/room/create', (_req: Request, res: Response) => {
   res.json({ pin });
 });
 
-// HTTP fallback signaling in case WebSockets fail or are blocked
-app.post('/api/signaling/send', (req: Request, res: Response) => {
-  const { to, message } = req.body;
-  if (!to || !message) {
-    return res.status(400).json({ error: 'Missing "to" or "message"' });
+// REST Join
+app.post('/api/room/join', (req: Request, res: Response) => {
+  const { pin, peerId, userName, audioEnabled, videoEnabled } = req.body;
+  if (!pin || !/^\d{4}$/.test(pin) || !peerId) {
+    return res.status(400).json({ error: 'Valid 4-digit PIN and peerId required' });
   }
-  let queue = fallbackMessageQueues.get(to);
-  if (!queue) {
-    queue = [];
-    fallbackMessageQueues.set(to, queue);
+
+  const room = getOrCreateRoom(pin);
+  if (room.peers.size >= 8 && !room.peers.has(peerId)) {
+    return res.status(403).json({ error: 'Room is full (max 8 participants)' });
   }
-  queue.push(message);
-  // Keep queue bounded
-  if (queue.length > 50) queue.shift();
+
+  let peer = room.peers.get(peerId);
+  const existingPeersList = Array.from(room.peers.values())
+    .filter((p) => p.id !== peerId)
+    .map((p) => ({
+      id: p.id,
+      name: p.name,
+      audioEnabled: p.audioEnabled,
+      videoEnabled: p.videoEnabled,
+      isScreenSharing: p.isScreenSharing,
+    }));
+
+  if (!peer) {
+    peer = {
+      id: peerId,
+      name: userName || `Guest-${peerId.slice(0, 4)}`,
+      pin,
+      ws: null,
+      audioEnabled: audioEnabled !== false,
+      videoEnabled: videoEnabled !== false,
+      isScreenSharing: false,
+      joinedAt: Date.now(),
+      lastSeenAt: Date.now(),
+      eventsQueue: [],
+    };
+    room.peers.set(peerId, peer);
+
+    console.log(`[PinCall] Peer ${peer.name} (${peerId}) joined Room #${pin} via HTTP. Total: ${room.peers.size}`);
+
+    // Notify other peers
+    broadcastToRoom(
+      pin,
+      {
+        type: 'peer-joined',
+        peer: {
+          id: peer.id,
+          name: peer.name,
+          audioEnabled: peer.audioEnabled,
+          videoEnabled: peer.videoEnabled,
+          isScreenSharing: false,
+        },
+      },
+      peerId
+    );
+  } else {
+    peer.lastSeenAt = Date.now();
+    if (userName) peer.name = userName;
+  }
+
+  res.json({
+    type: 'joined',
+    pin,
+    peerId,
+    peers: existingPeersList,
+  });
+});
+
+// REST Signal
+app.post('/api/room/signal', (req: Request, res: Response) => {
+  const { pin, from, to, data } = req.body;
+  if (!pin || !from || !to || !data) {
+    return res.status(400).json({ error: 'Missing pin, from, to, or data' });
+  }
+  const room = rooms.get(pin);
+  if (room) {
+    const targetPeer = room.peers.get(to);
+    if (targetPeer) {
+      dispatchToPeer(targetPeer, {
+        type: 'signal',
+        from,
+        data,
+      });
+      return res.json({ success: true });
+    }
+  }
+  res.status(404).json({ error: 'Target peer not found' });
+});
+
+// REST Media state
+app.post('/api/room/media-state', (req: Request, res: Response) => {
+  const { pin, peerId, audioEnabled, videoEnabled, isScreenSharing } = req.body;
+  const room = rooms.get(pin);
+  if (room) {
+    const peer = room.peers.get(peerId);
+    if (peer) {
+      if (audioEnabled !== undefined) peer.audioEnabled = audioEnabled;
+      if (videoEnabled !== undefined) peer.videoEnabled = videoEnabled;
+      if (isScreenSharing !== undefined) peer.isScreenSharing = isScreenSharing;
+      peer.lastSeenAt = Date.now();
+
+      broadcastToRoom(
+        pin,
+        {
+          type: 'peer-media-state',
+          peerId,
+          audioEnabled: peer.audioEnabled,
+          videoEnabled: peer.videoEnabled,
+          isScreenSharing: peer.isScreenSharing,
+        },
+        peerId
+      );
+    }
+  }
   res.json({ success: true });
 });
 
-app.get('/api/signaling/poll/:peerId', (req: Request, res: Response) => {
-  const peerId = req.params.peerId;
-  const queue = fallbackMessageQueues.get(peerId) || [];
-  fallbackMessageQueues.set(peerId, []);
-  res.json({ messages: queue });
+// REST Chat
+app.post('/api/room/chat', (req: Request, res: Response) => {
+  const { pin, peerId, userName, text } = req.body;
+  if (!pin || !text || !text.trim()) {
+    return res.status(400).json({ error: 'Invalid message' });
+  }
+  const chatObj = {
+    type: 'chat',
+    id: 'chat_' + Math.random().toString(36).substring(2, 9),
+    peerId,
+    userName: userName || 'Someone',
+    text: text.trim().slice(0, 500),
+    timestamp: Date.now(),
+  };
+  broadcastToRoom(pin, chatObj);
+  res.json({ success: true, message: chatObj });
 });
 
-// WebSocket Server
+// REST Reaction
+app.post('/api/room/reaction', (req: Request, res: Response) => {
+  const { pin, peerId, emoji } = req.body;
+  if (!pin || !emoji) return res.status(400).json({ error: 'Invalid reaction' });
+  const reactObj = {
+    type: 'reaction',
+    peerId,
+    emoji,
+    id: 'react_' + Math.random().toString(36).substring(2, 9),
+    timestamp: Date.now(),
+  };
+  broadcastToRoom(pin, reactObj);
+  res.json({ success: true });
+});
+
+// REST Poll Events
+app.get('/api/room/poll/:pin/:peerId', (req: Request, res: Response) => {
+  const { pin, peerId } = req.params;
+  const room = rooms.get(pin);
+  if (!room) {
+    return res.json({ events: [] });
+  }
+  const peer = room.peers.get(peerId);
+  if (!peer) {
+    return res.json({ events: [] });
+  }
+  peer.lastSeenAt = Date.now();
+  const events = [...peer.eventsQueue];
+  peer.eventsQueue = [];
+  res.json({ events });
+});
+
+// REST Leave
+app.post('/api/room/leave', (req: Request, res: Response) => {
+  const { pin, peerId } = req.body;
+  if (pin && peerId) {
+    removePeerFromRoom(pin, peerId);
+  }
+  res.json({ success: true });
+});
+
+// --- WebSocket Server ---
 const wss = new WebSocketServer({ noServer: true });
 
 server.on('upgrade', (request, socket, head) => {
   const pathname = request.url ? new URL(request.url, `http://${request.headers.host}`).pathname : '';
-  if (pathname === '/ws' || pathname === '/') {
+  // Only handle /ws or /signaling path so Vite HMR is unaffected!
+  if (pathname === '/ws' || pathname === '/signaling') {
     wss.handleUpgrade(request, socket, head, (ws) => {
       wss.emit('connection', ws, request);
     });
@@ -134,22 +344,12 @@ server.on('upgrade', (request, socket, head) => {
 });
 
 wss.on('connection', (ws: WebSocket) => {
-  let currentPeerId: string | null = null;
-  let currentPin: string | null = null;
+  let boundPeerId: string | null = null;
+  let boundPin: string | null = null;
 
   const send = (socket: WebSocket, data: any) => {
     if (socket.readyState === WebSocket.OPEN) {
       socket.send(JSON.stringify(data));
-    }
-  };
-
-  const broadcastToRoom = (pin: string, data: any, excludePeerId?: string) => {
-    const room = rooms.get(pin);
-    if (!room) return;
-    for (const [id, peer] of room.peers.entries()) {
-      if (id !== excludePeerId && peer.ws) {
-        send(peer.ws, data);
-      }
     }
   };
 
@@ -164,72 +364,84 @@ wss.on('connection', (ws: WebSocket) => {
             return send(ws, { type: 'error', message: 'Invalid 4-digit PIN or peer ID' });
           }
 
-          currentPeerId = peerId;
-          currentPin = pin;
+          boundPeerId = peerId;
+          boundPin = pin;
 
           const room = getOrCreateRoom(pin);
-          if (room.peers.size >= 8) {
+          if (room.peers.size >= 8 && !room.peers.has(peerId)) {
             return send(ws, { type: 'error', message: 'Room is full (max 8 participants)' });
           }
 
-          const existingPeersList = Array.from(room.peers.values()).map((p) => ({
-            id: p.id,
-            name: p.name,
-            audioEnabled: p.audioEnabled,
-            videoEnabled: p.videoEnabled,
-            isScreenSharing: p.isScreenSharing,
-          }));
+          let peer = room.peers.get(peerId);
+          const existingPeersList = Array.from(room.peers.values())
+            .filter((p) => p.id !== peerId)
+            .map((p) => ({
+              id: p.id,
+              name: p.name,
+              audioEnabled: p.audioEnabled,
+              videoEnabled: p.videoEnabled,
+              isScreenSharing: p.isScreenSharing,
+            }));
 
-          const newPeer: Peer = {
-            id: peerId,
-            name: userName || `Guest-${peerId.slice(0, 4)}`,
-            pin,
-            ws,
-            audioEnabled: audioEnabled !== false,
-            videoEnabled: videoEnabled !== false,
-            isScreenSharing: false,
-            joinedAt: Date.now(),
-          };
+          if (!peer) {
+            peer = {
+              id: peerId,
+              name: userName || `Guest-${peerId.slice(0, 4)}`,
+              pin,
+              ws,
+              audioEnabled: audioEnabled !== false,
+              videoEnabled: videoEnabled !== false,
+              isScreenSharing: false,
+              joinedAt: Date.now(),
+              lastSeenAt: Date.now(),
+              eventsQueue: [],
+            };
+            room.peers.set(peerId, peer);
 
-          room.peers.set(peerId, newPeer);
+            console.log(`[PinCall] Peer ${peer.name} (${peerId}) joined Room #${pin} via WS. Total: ${room.peers.size}`);
 
-          // Confirm join to the new peer with existing peers
+            // Broadcast peer-joined to others
+            broadcastToRoom(
+              pin,
+              {
+                type: 'peer-joined',
+                peer: {
+                  id: peer.id,
+                  name: peer.name,
+                  audioEnabled: peer.audioEnabled,
+                  videoEnabled: peer.videoEnabled,
+                  isScreenSharing: false,
+                },
+              },
+              peerId
+            );
+          } else {
+            peer.ws = ws;
+            peer.lastSeenAt = Date.now();
+            if (userName) peer.name = userName;
+          }
+
+          // Confirm join to this peer
           send(ws, {
             type: 'joined',
             pin,
             peerId,
             peers: existingPeersList,
           });
-
-          // Notify existing peers about the newcomer
-          broadcastToRoom(
-            pin,
-            {
-              type: 'peer-joined',
-              peer: {
-                id: newPeer.id,
-                name: newPeer.name,
-                audioEnabled: newPeer.audioEnabled,
-                videoEnabled: newPeer.videoEnabled,
-                isScreenSharing: false,
-              },
-            },
-            peerId
-          );
           break;
         }
 
         case 'signal': {
           const { to, data } = msg;
-          if (!to || !currentPeerId || !currentPin) return;
+          if (!to || !boundPeerId || !boundPin) return;
 
-          const room = rooms.get(currentPin);
+          const room = rooms.get(boundPin);
           if (room) {
-            const targetPeer = room.peers.get(to);
-            if (targetPeer && targetPeer.ws) {
-              send(targetPeer.ws, {
+            const target = room.peers.get(to);
+            if (target) {
+              dispatchToPeer(target, {
                 type: 'signal',
-                from: currentPeerId,
+                from: boundPeerId,
                 data,
               });
             }
@@ -238,26 +450,27 @@ wss.on('connection', (ws: WebSocket) => {
         }
 
         case 'media-state': {
-          if (!currentPin || !currentPeerId) return;
+          if (!boundPin || !boundPeerId) return;
           const { audioEnabled, videoEnabled, isScreenSharing } = msg;
-          const room = rooms.get(currentPin);
+          const room = rooms.get(boundPin);
           if (room) {
-            const peer = room.peers.get(currentPeerId);
+            const peer = room.peers.get(boundPeerId);
             if (peer) {
               if (audioEnabled !== undefined) peer.audioEnabled = audioEnabled;
               if (videoEnabled !== undefined) peer.videoEnabled = videoEnabled;
               if (isScreenSharing !== undefined) peer.isScreenSharing = isScreenSharing;
+              peer.lastSeenAt = Date.now();
 
               broadcastToRoom(
-                currentPin,
+                boundPin,
                 {
                   type: 'peer-media-state',
-                  peerId: currentPeerId,
+                  peerId: boundPeerId,
                   audioEnabled: peer.audioEnabled,
                   videoEnabled: peer.videoEnabled,
                   isScreenSharing: peer.isScreenSharing,
                 },
-                currentPeerId
+                boundPeerId
               );
             }
           }
@@ -265,69 +478,75 @@ wss.on('connection', (ws: WebSocket) => {
         }
 
         case 'chat': {
-          if (!currentPin || !currentPeerId) return;
+          if (!boundPin || !boundPeerId) return;
           const { text, userName } = msg;
           if (!text || !text.trim()) return;
 
-          broadcastToRoom(currentPin, {
+          const chatObj = {
             type: 'chat',
             id: 'chat_' + Math.random().toString(36).substring(2, 9),
-            peerId: currentPeerId,
+            peerId: boundPeerId,
             userName: userName || 'Someone',
             text: text.trim().slice(0, 500),
             timestamp: Date.now(),
-          });
+          };
+          broadcastToRoom(boundPin, chatObj);
           break;
         }
 
         case 'reaction': {
-          if (!currentPin || !currentPeerId) return;
+          if (!boundPin || !boundPeerId) return;
           const { emoji } = msg;
           if (!emoji) return;
 
-          broadcastToRoom(currentPin, {
+          const reactObj = {
             type: 'reaction',
-            peerId: currentPeerId,
+            peerId: boundPeerId,
             emoji,
             id: 'react_' + Math.random().toString(36).substring(2, 9),
             timestamp: Date.now(),
-          });
+          };
+          broadcastToRoom(boundPin, reactObj);
           break;
         }
 
         case 'leave': {
-          cleanupPeer();
+          if (boundPin && boundPeerId) {
+            removePeerFromRoom(boundPin, boundPeerId);
+            boundPin = null;
+            boundPeerId = null;
+          }
           break;
         }
       }
     } catch (err) {
-      console.error('Error handling WS message:', err);
+      console.error('Error in WS message:', err);
     }
   });
 
-  const cleanupPeer = () => {
-    if (currentPin && currentPeerId) {
-      const room = rooms.get(currentPin);
+  ws.on('close', () => {
+    if (boundPin && boundPeerId) {
+      const room = rooms.get(boundPin);
       if (room) {
-        room.peers.delete(currentPeerId);
-        broadcastToRoom(currentPin, {
-          type: 'peer-left',
-          peerId: currentPeerId,
-        });
-        if (room.peers.size === 0) {
-          rooms.delete(currentPin);
+        const peer = room.peers.get(boundPeerId);
+        if (peer && peer.ws === ws) {
+          peer.ws = null;
+          // Don't immediately delete; allow 10s grace period for refresh or fallback polling
+          setTimeout(() => {
+            const currentRoom = rooms.get(boundPin!);
+            if (currentRoom) {
+              const currentPeer = currentRoom.peers.get(boundPeerId!);
+              if (currentPeer && !currentPeer.ws && Date.now() - currentPeer.lastSeenAt > 10000) {
+                removePeerFromRoom(boundPin!, boundPeerId!);
+              }
+            }
+          }, 10000);
         }
       }
-      currentPeerId = null;
-      currentPin = null;
     }
-  };
-
-  ws.on('close', cleanupPeer);
-  ws.on('error', cleanupPeer);
+  });
 });
 
-// Vite Middleware or Production Static Handler
 async function setupVite() {
   const isProd = process.env.NODE_ENV === 'production';
   if (!isProd) {

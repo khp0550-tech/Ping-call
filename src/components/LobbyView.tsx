@@ -207,6 +207,10 @@ export const LobbyView: React.FC<LobbyViewProps> = ({ onJoin, initialPin = '' })
 
   const submitJoin = () => {
     if (!isPinComplete) return;
+    if (previewStream) {
+      previewStream.getTracks().forEach((t) => t.stop());
+      setPreviewStream(null);
+    }
     const effectiveName = userName.trim() || `User-${Math.floor(100 + Math.random() * 900)}`;
     localStorage.setItem('pincall_username', effectiveName);
     onJoin(currentPin, effectiveName, micEnabled, cameraEnabled);

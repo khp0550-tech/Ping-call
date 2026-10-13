@@ -36,12 +36,14 @@ export const VideoTile: React.FC<VideoTileProps> = ({
   useEffect(() => {
     if (videoRef.current && stream) {
       videoRef.current.srcObject = stream;
+      videoRef.current.play().catch(() => {});
       const vTracks = stream.getVideoTracks();
       setHasVideoTrack(vTracks.length > 0 && vTracks.some((t) => t.enabled));
 
       const handleTrackChange = () => {
         const tracks = stream.getVideoTracks();
         setHasVideoTrack(tracks.length > 0 && tracks.some((t) => t.enabled));
+        videoRef.current?.play().catch(() => {});
       };
 
       stream.addEventListener('addtrack', handleTrackChange);

@@ -209,9 +209,23 @@ export const CallView: React.FC<CallViewProps> = ({
         </div>
 
         {/* Center / Security Indicator */}
-        <div className="hidden md:flex items-center gap-2 text-xs text-zinc-400">
-          <Shield className="w-3.5 h-3.5 text-emerald-400" />
-          <span>WebRTC P2P Direct Stream</span>
+        <div className="flex items-center gap-2 text-xs bg-zinc-900 px-3 py-1.5 rounded-full border border-zinc-800">
+          <span
+            className={`w-2 h-2 rounded-full ${
+              connectionStatus === 'connected'
+                ? 'bg-emerald-500'
+                : connectionStatus === 'connecting'
+                ? 'bg-amber-400 animate-ping'
+                : 'bg-red-500'
+            }`}
+          />
+          <span className="text-zinc-300 font-medium">
+            {connectionStatus === 'connected'
+              ? totalParticipants > 1
+                ? `${totalParticipants} connected`
+                : 'Ready • Waiting for others'
+              : 'Connecting to room...'}
+          </span>
         </div>
 
         {/* Right Header Quick Actions */}
